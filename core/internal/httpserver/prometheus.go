@@ -206,5 +206,5 @@ func getTopicDetail(app *protocol.ApplicationContext, cluster, topic string) []i
 		return []int64{}
 	}
 
-	return response.([]int64)
+	return response.(protocol.TopicDescription).Offsets
 }

@@ -41,10 +41,15 @@ type KafkaCluster struct {
 	offsetRefresh       int
 	topicRefresh        int
 	groupsReaperRefresh int
+	topicConfigRefresh  int
+	numWorkers          int
+	topicProperties     []string
+	fetchTopicConfig    bool
 
 	offsetTicker       *time.Ticker
 	metadataTicker     *time.Ticker
 	groupsReaperTicker *time.Ticker
+	topicConfigTicker  *time.Ticker
 	quitChannel        chan struct{}
 	running            sync.WaitGroup
 
@@ -76,9 +81,17 @@ func (module *KafkaCluster) Configure(name, configRoot string) {
 	viper.SetDefault(configRoot+".offset-refresh", 10)
 	viper.SetDefault(configRoot+".topic-refresh", 60)
 	viper.SetDefault(configRoot+".groups-reaper-refresh", 0)
+	viper.SetDefault(configRoot+".topic-config-refresh", 3600)
+	viper.SetDefault(configRoot+".workers", 20)
 	module.offsetRefresh = viper.GetInt(configRoot + ".offset-refresh")
 	module.topicRefresh = viper.GetInt(configRoot + ".topic-refresh")
 	module.groupsReaperRefresh = viper.GetInt(configRoot + ".groups-reaper-refresh")
+	module.topicConfigRefresh = viper.GetInt(configRoot + ".topic-config-refresh")
+	module.numWorkers = viper.GetInt(configRoot + ".workers")
+	if viper.GetStringSlice(configRoot+".topic-properties") != nil {
+		module.topicProperties = viper.GetStringSlice(configRoot + ".topic-properties")
+		module.fetchTopicConfig = true
+	}
 }
 
 // Start connects to the Kafka cluster using the Shopify/sarama client. Any error connecting to the cluster is returned
@@ -86,23 +99,22 @@ func (module *KafkaCluster) Configure(name, configRoot string) {
 func (module *KafkaCluster) Start() error {
 	module.Log.Info("starting")
 
-	// Connect Kafka client
-	client, err := sarama.NewClient(module.servers, module.saramaConfig)
+	// Fire off the offset requests once, before we start the ticker, to make sure we start with good data for consumers
+	helperClient, err := helpers.NewBurrowSaramaClient(module.servers, module.saramaConfig, module.Log)
 	if err != nil {
 		module.Log.Error("failed to start client", zap.Error(err))
 		return err
 	}
-
-	// Fire off the offset requests once, before we start the ticker, to make sure we start with good data for consumers
-	helperClient := &helpers.BurrowSaramaClient{
-		Client: client,
-	}
 	module.fetchMetadata = true
 	module.getOffsets(helperClient)
+	if module.fetchTopicConfig {
+		module.getTopicConfig(helperClient)
+	}
 
 	// Start main loop that has a timer for offset and topic fetches
 	module.offsetTicker = time.NewTicker(time.Duration(module.offsetRefresh) * time.Second)
 	module.metadataTicker = time.NewTicker(time.Duration(module.topicRefresh) * time.Second)
+	module.topicConfigTicker = time.NewTicker(time.Duration(module.topicConfigRefresh) * time.Second)
 
 	if module.groupsReaperRefresh != 0 {
 		module.groupsReaperTicker = time.NewTicker(time.Duration(module.groupsReaperRefresh) * time.Second)
@@ -147,6 +159,10 @@ func (module *KafkaCluster) mainLoop(client helpers.SaramaClient) {
 			module.fetchMetadata = true
 		case <-module.groupsReaperTicker.C:
 			module.reapNonExistingGroups(client)
+		case <-module.topicConfigTicker.C:
+			if module.fetchTopicConfig {
+				module.getTopicConfig(client)
+			}
 		case <-module.quitChannel:
 			return
 		}
@@ -206,6 +222,89 @@ func (module *KafkaCluster) maybeUpdateMetadataAndDeleteTopics(client helpers.Sa
 
 		// Save the new topicPartitions for next time
 		module.topicPartitions = topicPartitions
+
+		// Send set existed topic metadata request
+		topicPartitionMetadatas := client.DescribeTopics()
+		for key, value := range topicPartitionMetadatas {
+			metadata := &protocol.StorageRequest{
+				RequestType:        protocol.StorageSetTopicMetadata,
+				Cluster:            module.name,
+				Topic:              key,
+				PartitionMetadatas: value,
+			}
+			helpers.TimeoutSendStorageRequest(module.App.StorageChannel, metadata, 1)
+		}
+		module.Log.Debug("send topic request",
+			zap.String("cluster_name", module.name),
+			zap.Int("count", len(topicPartitionMetadatas)),
+		)
+	}
+}
+
+type topicConfig struct {
+	Topic  string
+	Config map[string]string
+}
+
+func (module *KafkaCluster) getTopicConfig(client helpers.SaramaClient) {
+	topicList, err := client.Topics()
+	if err != nil {
+		module.Log.Error("failed to fetch topic list for getting config", zap.String("sarama_error", err.Error()))
+		return
+	}
+
+	result := make(map[string]map[string]string)
+	numWorkers := module.numWorkers
+	numTopics := len(topicList)
+	if numWorkers > numTopics {
+		numWorkers = numTopics
+	}
+
+	module.Log.Info("starting configs", zap.Int("count", numTopics))
+
+	topicConfigChan := make(chan topicConfig)
+	for i := 0; i < numWorkers; i++ {
+		go func(workerId int) {
+			for j := workerId; j < numTopics; j += numWorkers {
+				if j >= numTopics {
+					break
+				}
+				config, topic, err := client.DescribeConfig(sarama.ConfigResource{
+					Type:        sarama.TopicResource,
+					Name:        topicList[j],
+					ConfigNames: module.topicProperties,
+				})
+				if err != nil {
+					module.Log.Error(err.Error())
+					topicConfigChan <- topicConfig{Topic: topic, Config: nil}
+				} else {
+					topicConfigChan <- topicConfig{Topic: topic, Config: config}
+				}
+			}
+		}(i)
+	}
+
+	quit := make(chan bool)
+	go func() {
+		for i := 0; i < numTopics; i++ {
+			res := <-topicConfigChan
+			if res.Config != nil {
+				result[res.Topic] = res.Config
+			}
+		}
+		quit <- true
+	}()
+	<-quit
+
+	// Send setting topic config request
+	for topic, config := range result {
+		topicConfig := &protocol.StorageRequest{
+			RequestType: protocol.StorageSetTopicMetadata,
+			Cluster:     module.name,
+			Topic:       topic,
+			TopicConfig: config,
+		}
+		helpers.TimeoutSendStorageRequest(module.App.StorageChannel, topicConfig, 1)
 	}
 }
 

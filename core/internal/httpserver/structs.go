@@ -70,10 +70,10 @@ type httpResponseTopicList struct {
 }
 
 type httpResponseTopicDetail struct {
-	Error   bool                    `json:"error"`
-	Message string                  `json:"message"`
-	Offsets []int64                 `json:"offsets"`
-	Request httpResponseRequestInfo `json:"request"`
+	Error   bool                      `json:"error"`
+	Message string                    `json:"message"`
+	Topic   protocol.TopicDescription `json:"topic"`
+	Request httpResponseRequestInfo   `json:"request"`
 }
 
 type httpResponseTopicConsumerDetail struct {

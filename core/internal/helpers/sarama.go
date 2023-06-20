@@ -12,7 +12,13 @@ package helpers
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
+	"io"
+	"net"
 	"os"
+	"sort"
+	"sync"
+	"syscall"
 	"time"
 
 	"go.uber.org/zap"
@@ -21,6 +27,8 @@ import (
 	"github.com/Shopify/sarama"
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/mock"
+
+	"github.com/linkedin/Burrow/core/protocol"
 )
 
 // Since 1.X Kafka has moved to semver, so those have a consistent format. For earlier versions we support formats:
@@ -213,11 +221,48 @@ type SaramaClient interface {
 	// used in the code as a Set, the consumer group type is not relevant, we
 	// decided to not convert it to a map[string]struct returned by Sarama
 	ListConsumerGroups() (map[string]string, error)
+
+	// DescribeTopics describe the specified topics metadata
+	DescribeTopics() map[string][]protocol.PartitionMetadata
+
+	// DescribeConfig describe the config of topic
+	DescribeConfig(resource sarama.ConfigResource) (map[string]string, string, error)
+
+	// Reset reset admin client when met "write: broken pipe" error
+	Reset() error
 }
 
 // BurrowSaramaClient is an implementation of the SaramaClient interface for use in Burrow modules
 type BurrowSaramaClient struct {
+	servers []string
+	config  *sarama.Config
+
+	mu sync.Mutex
+
 	Client sarama.Client
+	Admin  sarama.ClusterAdmin
+	Log    *zap.Logger
+}
+
+func NewBurrowSaramaClient(servers []string, config *sarama.Config, log *zap.Logger) (*BurrowSaramaClient, error) {
+	// Connect Kafka client
+	client, err := sarama.NewClient(servers, config)
+	if err != nil {
+		return nil, err
+	}
+	// Connect Kafka admin
+	admin, err := sarama.NewClusterAdminFromClient(client)
+	if err != nil {
+		return nil, err
+	}
+
+	return &BurrowSaramaClient{
+		servers: servers,
+		config:  config,
+		Client:  client,
+		Admin:   admin,
+		Log:     log,
+	}, nil
 }
 
 // Config returns the Config struct of the client. This struct should not be altered after it has been created.
@@ -320,6 +365,88 @@ func (c *BurrowSaramaClient) Closed() bool {
 // underlying client when shutting down this consumer.
 func (c *BurrowSaramaClient) NewConsumerFromClient() (sarama.Consumer, error) {
 	return sarama.NewConsumerFromClient(c.Client)
+}
+
+// DescribeTopics describe all topics metadata
+func (c *BurrowSaramaClient) DescribeTopics() map[string][]protocol.PartitionMetadata {
+	metadata := c.Client.TopicPartitions()
+	result := make(map[string][]protocol.PartitionMetadata)
+	for k, v := range metadata {
+		value := make([]protocol.PartitionMetadata, 0)
+		for _, partition := range v {
+			value = append(value, protocol.PartitionMetadata{
+				ID:              partition.ID,
+				Leader:          partition.Leader,
+				LeaderEpoch:     partition.LeaderEpoch,
+				Replicas:        partition.Replicas,
+				Isr:             partition.Isr,
+				OfflineReplicas: partition.OfflineReplicas,
+			})
+		}
+		sort.Slice(value, func(i, j int) bool {
+			return value[i].ID < value[j].ID
+		})
+		result[k] = value
+	}
+	return result
+}
+
+// DescribeConfig describe the config of topic
+func (c *BurrowSaramaClient) DescribeConfig(resource sarama.ConfigResource) (map[string]string, string, error) {
+	var (
+		configEntries []sarama.ConfigEntry
+		err           error
+	)
+	exec := func() error {
+		configEntries, err = c.Admin.DescribeConfig(resource)
+		return err
+	}
+	err = c.executeWithRetry("DescribeConfig", exec)
+	if err != nil {
+		return nil, resource.Name, err
+	}
+
+	result := make(map[string]string)
+	for _, entry := range configEntries {
+		result[entry.Name] = entry.Value
+	}
+	return result, resource.Name, nil
+}
+
+// Reset reset admin client when met "write: broken pipe" error
+func (c *BurrowSaramaClient) Reset() error {
+	newClient, err := sarama.NewClient(c.servers, c.config)
+	if err != nil {
+		return err
+	}
+	newAdmin, err := sarama.NewClusterAdminFromClient(newClient)
+	if err != nil {
+		return err
+	}
+	_ = c.Client.Close()
+	_ = c.Admin.Close()
+	c.Client = newClient
+	c.Admin = newAdmin
+	c.Log.Info("kafka client is reset")
+	return nil
+}
+
+func (c *BurrowSaramaClient) executeWithRetry(methodName string, exec func() error) error {
+	err := exec()
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, syscall.EPIPE) || errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) {
+		c.Log.Error("execute failed, will retry it", zap.String("method", methodName), zap.Error(err))
+		c.mu.Lock()
+		if err := c.Reset(); err != nil {
+			c.Log.Error("reset kafka client failed")
+			return err
+		}
+		c.mu.Unlock()
+		return exec()
+	}
+	return err
 }
 
 // SaramaBroker is an internal interface on the sarama.Broker struct. It is used with the SaramaClient interface in
@@ -470,6 +597,16 @@ func (m *MockSaramaClient) NewConsumerFromClient() (sarama.Consumer, error) {
 func (m *MockSaramaClient) ListConsumerGroups() (map[string]string, error) {
 	args := m.Called()
 	return args.Get(0).(map[string]string), args.Error(1)
+}
+
+func (m *MockSaramaClient) DescribeTopics() map[string][]protocol.PartitionMetadata {
+	args := m.Called()
+	return args.Get(0).(map[string][]protocol.PartitionMetadata)
+}
+
+func (m *MockSaramaClient) DescribeConfig(resource sarama.ConfigResource) (map[string]string, string, error) {
+	args := m.Called(resource)
+	return args.Get(0).(map[string]string), args.Get(1).(string), args.Error(2)
 }
 
 // MockSaramaBroker is a mock of SaramaBroker. It is used in tests by multiple packages. It should never be used in the

@@ -61,6 +61,9 @@ const (
 	// StorageFetchConsumersForTopic is the request type to obtain a list of all consumer groups consuming from a topic.
 	// Returns a []string
 	StorageFetchConsumersForTopic StorageRequestConstant = 11
+
+	// StorageSetTopicMetadata is the request type to store a topic metadata
+	StorageSetTopicMetadata StorageRequestConstant = 12
 )
 
 var storageRequestStrings = [...]string{
@@ -76,6 +79,7 @@ var storageRequestStrings = [...]string{
 	"StorageFetchTopic",
 	"StorageClearConsumerOwners",
 	"StorageFetchConsumersForTopic",
+	"StorageSetTopicMetadata",
 }
 
 // String returns a string representation of a StorageRequestConstant for logging
@@ -138,6 +142,12 @@ type StorageRequest struct {
 
 	// For StorageSetConsumerOwner requests, a string containing the client_id set by the consumer
 	ClientID string
+
+	// For StorageSetTopicMetadata requests, an array containing the partition metadata by the admin
+	PartitionMetadatas []PartitionMetadata
+
+	// For StorageSetTopicMetadata requests, an map containing the topic created configuration by the admin
+	TopicConfig map[string]string
 }
 
 // ConsumerPartition represents the information stored for a group for a single partition. It is used as part of the
@@ -206,3 +216,31 @@ type ConsumerTopics map[string]ConsumerPartitions
 // ConsumerPartitions describes all partitions for a single topic. The index indicates the partition ID, and the value
 // is a pointer to a ConsumerPartition object with the offset information for that partition.
 type ConsumerPartitions []*ConsumerPartition
+
+// PartitionMetadata contains each partition in the topic.
+type PartitionMetadata struct {
+	// ID contains the partition index.
+	ID int32 `json:"id"`
+	// Leader contains the ID of the leader broker.
+	Leader int32 `json:"leader"`
+	// LeaderEpoch contains the leader epoch of this partition.
+	LeaderEpoch int32 `json:"leader_epoch"`
+	// Replicas contains the set of all nodes that host this partition.
+	Replicas []int32 `json:"replicas"`
+	// Isr contains the set of nodes that are in sync with the leader for this partition.
+	Isr []int32 `json:"isr"`
+	// OfflineReplicas contains the set of offline replicas of this partition.
+	OfflineReplicas []int32 `json:"offline_replicas"`
+}
+
+// TopicDescription describes topic detail info
+type TopicDescription struct {
+	// PartitionMetadata contains each partition in the topic.
+	Partitions []PartitionMetadata `json:"partitions"`
+
+	// Topic config
+	Config map[string]string `json:"config"`
+
+	// Offset contains the latest offsets
+	Offsets []int64 `json:"offsets"`
+}

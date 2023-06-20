@@ -138,7 +138,7 @@ func (hc *Coordinator) handleTopicDetail(w http.ResponseWriter, r *http.Request,
 		hc.writeResponse(w, r, http.StatusOK, httpResponseTopicDetail{
 			Error:   false,
 			Message: "topic offsets returned",
-			Offsets: response.([]int64),
+			Topic:   response.(protocol.TopicDescription),
 			Request: requestInfo,
 		})
 	}

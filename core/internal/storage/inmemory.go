@@ -73,6 +73,7 @@ type consumerGroup struct {
 type clusterOffsets struct {
 	broker   map[string][]*ring.Ring
 	consumer map[string]*consumerGroup
+	topic    map[string]protocol.TopicDescription
 
 	// This lock is used when modifying broker topics or offsets
 	brokerLock *sync.RWMutex
@@ -80,6 +81,9 @@ type clusterOffsets struct {
 	// This lock is used when modifying the overall consumer list
 	// It does not need to be held for modifying an individual group
 	consumerLock *sync.RWMutex
+
+	// This lock is used when modifying topic metadata
+	topicLock *sync.RWMutex
 }
 
 // Represents the destination of adding an offset into
@@ -178,8 +182,10 @@ func (module *InMemoryStorage) Start() error {
 			offsets[cluster] = clusterOffsets{
 			broker:       make(map[string][]*ring.Ring),
 			consumer:     make(map[string]*consumerGroup),
+			topic:        make(map[string]protocol.TopicDescription),
 			brokerLock:   &sync.RWMutex{},
 			consumerLock: &sync.RWMutex{},
+			topicLock:    &sync.RWMutex{},
 		}
 	}
 
@@ -229,6 +235,7 @@ func (module *InMemoryStorage) requestWorker(workerNum int, requestChannel chan 
 		protocol.StorageFetchTopic:             module.fetchTopic,
 		protocol.StorageClearConsumerOwners:    module.clearConsumerOwners,
 		protocol.StorageFetchConsumersForTopic: module.fetchConsumersForTopicList,
+		protocol.StorageSetTopicMetadata:       module.addTopicMetadata,
 	}
 
 	workerLogger := module.Log.With(zap.Int("worker", workerNum))
@@ -254,7 +261,7 @@ func (module *InMemoryStorage) mainLoop() {
 
 	for r := range module.requestChannel {
 		switch r.RequestType {
-		case protocol.StorageSetBrokerOffset, protocol.StorageSetDeleteTopic, protocol.StorageFetchClusters, protocol.StorageFetchConsumers, protocol.StorageFetchTopics, protocol.StorageFetchTopic, protocol.StorageFetchConsumersForTopic:
+		case protocol.StorageSetBrokerOffset, protocol.StorageSetDeleteTopic, protocol.StorageFetchClusters, protocol.StorageFetchConsumers, protocol.StorageFetchTopics, protocol.StorageFetchTopic, protocol.StorageFetchConsumersForTopic, protocol.StorageSetTopicMetadata:
 			// Send to any worker
 			module.workers[int(rand.Int31n(int32(module.numWorkers)))] <- r
 		case protocol.StorageSetConsumerOffset, protocol.StorageSetConsumerOwner, protocol.StorageSetDeleteGroup, protocol.StorageClearConsumerOwners, protocol.StorageFetchConsumer:
@@ -656,6 +663,11 @@ func (module *InMemoryStorage) deleteTopic(request *protocol.StorageRequest, req
 	delete(clusterMap.broker, request.Topic)
 	clusterMap.brokerLock.Unlock()
 
+	// Remove the topic from the topic metadata list
+	clusterMap.topicLock.Lock()
+	delete(clusterMap.topic, request.Topic)
+	clusterMap.topicLock.Unlock()
+
 	requestLogger.Debug("ok")
 }
 
@@ -758,8 +770,19 @@ func (module *InMemoryStorage) fetchTopic(request *protocol.StorageRequest, requ
 	}
 	clusterMap.brokerLock.RUnlock()
 
+	clusterMap.topicLock.RLock()
+	topicDesc, ok := clusterMap.topic[request.Topic]
+	if !ok {
+		requestLogger.Warn("unknown topic for metadata")
+		clusterMap.topicLock.RUnlock()
+		return
+	}
+	// Set latest offsets to topic
+	topicDesc.Offsets = offsetList
+	clusterMap.topicLock.RUnlock()
+
 	requestLogger.Debug("ok")
-	request.Reply <- offsetList
+	request.Reply <- topicDesc
 }
 
 func getConsumerTopicList(consumerMap *consumerGroup) protocol.ConsumerTopics {
@@ -903,4 +926,29 @@ func (module *InMemoryStorage) fetchConsumersForTopicList(request *protocol.Stor
 
 	requestLogger.Debug("ok")
 	request.Reply <- consumerListForTopic
+}
+
+func (module *InMemoryStorage) addTopicMetadata(request *protocol.StorageRequest, requestLogger *zap.Logger) {
+	clusterMap, ok := module.offsets[request.Cluster]
+	if !ok {
+		// Ignore offsets for clusters that we don't know about - should never happen anyways
+		requestLogger.Warn("unknown cluster")
+		return
+	}
+
+	// Add topic partition metadata
+	clusterMap.topicLock.Lock()
+	defer clusterMap.topicLock.Unlock()
+	topicDesc, ok := clusterMap.topic[request.Topic]
+	if ok {
+		if request.PartitionMetadatas != nil {
+			topicDesc.Partitions = request.PartitionMetadatas
+		}
+		if request.TopicConfig != nil {
+			topicDesc.Config = request.TopicConfig
+		}
+	} else {
+		topicDesc = protocol.TopicDescription{Partitions: request.PartitionMetadatas, Config: request.TopicConfig}
+	}
+	clusterMap.topic[request.Topic] = topicDesc
 }
